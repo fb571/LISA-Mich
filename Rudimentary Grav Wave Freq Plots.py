@@ -123,8 +123,8 @@ w = get_window('hann', N+1)
 W = np.sum(w**2)/(N+1)
 
 # Compute FFTs (normalized)
-X = h*np.fft.rfft((hcr)*w) / np.sqrt(W)
-Y = h*np.fft.rfft((hpl)*w) / np.sqrt(W)
+X = 2*h*np.fft.rfft((hcr)*w) / np.sqrt(W)
+Y = 2*h*np.fft.rfft((hpl)*w) / np.sqrt(W)
 
 #LISA Noise Curve
 L = 2.5e9
@@ -157,3 +157,4 @@ plt.title("Gravitational Wave Polarizations Over Frequency")
 plt.grid(True)
 plt.tight_layout()
 plt.show()
+
