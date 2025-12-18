@@ -3,11 +3,11 @@ import numpy as np
 from scipy.special import jv  # Bessel function of the first kind
 from scipy.signal import get_window
 
-ω0 = 0.5*0.03795*(2*np.pi) #Initial Frequency
-e0 = 0.3 #Initial Eccentricity
-m1 = 0.32 #Mass of Primary
-m2 = 0.37 #Mass of Secondary
-r = 2.7846e09 #Distance of Binary from Observer
+ω0 = 0.311*(2*np.pi) #Initial Frequency
+e0 = 0.1 #Initial Eccentricity
+m1 = 0.55 #Mass of Primary
+m2 = 0.27 #Mass of Secondary
+r = 1e11 #Distance of Binary from Observer
 I = 0 #Angle of Inclination
 φ = 0 #Angle of Pericentre
 
@@ -16,8 +16,8 @@ c = 20.04 #Speed of Light
 a0 = (G*(m1+m2)/ω0**2)**(1/3) #Initial Semimajor Axis
 
 #Number of timesteps and the time interval value
-N = 4000
-h = 0.1
+N = 1000
+h = 0.01
 
 #"Independent" variables (at least independent to begin with)
 # Units of 0.01AU = 100s = 1 solar mass = 1
@@ -78,38 +78,42 @@ Bn = a2_over_n * (1.0 - e[:, None]**2) * (J_p2 - J_m2)
 Cn = a2_over_n * np.sqrt(1.0 - e[:, None]**2) * (J_p2 + J_m2 - e[:, None] * (J_p1 + J_m1))
 
 # Compute omega for each time (note: omega depends on a[i])
-omega = np.sqrt(G * (m1 + m2) / a**3)      # shape (N+1,)
+omega = np.sqrt(G*(m1 + m2)/a**3)
+nomegasquared = (omega[:, None]**2) * (n[None, :])**2
+print(nomegasquared)
 
-# Compute the per-time-per-harmonic phase: n * omega_i * t_i
-# For each time i and harmonic n: phase[i,n] = n * omega[i] * t[i]
-phase = (omega * t)[:, None] * n[None, :]  # shape (N+1, nmax)
+# --- Phase (still (N+1,nmax)) ---
+phase = (omega * t)[:, None] * n[None, :]
 
 cos_phase = np.cos(phase)
 sin_phase = np.sin(phase)
 
-# Precompute geometric angle combinations (scalars)
-Cphi = np.cos(φ); Sphi = np.sin(φ)
-C2phi = np.cos(2.0*φ); S2phi = np.sin(2.0*φ)
-CI = np.cos(I); SI = np.sin(I)
+# --- Geometric angles ---
+Cphi = np.cos(φ)
+Sphi = np.sin(φ)
+C2phi = np.cos(2.0*φ)
+S2phi = np.sin(2.0*φ)
+CI = np.cos(I)
+SI = np.sin(I)
 
-# Coefficient arrays multiplying the trigonometric time dependence
-Hp_coef = (
+# --- Coefficient arrays ---
+Hp_coef = nomegasquared*(
     An * (Cphi**2 - Sphi**2 * CI**2)
     + Bn * (Sphi**2 - Cphi**2 * CI**2)
     - Cn * (np.sin(2.0*φ)) * (1.0 + CI**2)
-)   # shape (N+1, nmax)
+)
 
-Hc_coef = (
+Hc_coef = nomegasquared*(
     2.0 * C2phi * CI * Cn
     + (An - Bn) * S2phi * SI
-)   # shape (N+1, nmax)
+)
 
-# Mass factor
+# --- Mass factors ---
 mu = (m1 * m2) / (m1 + m2)
+mc = ((m1*m2)**(3/5)) / ((m1+m2)**(1/5))
 
-# Now compute the summed harmonic contributions (vectorized)
-# sum over harmonics (axis=1) to collapse to shape (N+1,)
-prefactor = - (mu * (omega**2) * G) / (r * c**4)   # shape (N+1,)
+# --- Prefactors (now scalars repeated over N) ---
+prefactor = - (mu * G) / (r * c**4)
 
 hplus_vec  = prefactor * np.sum(Hp_coef * cos_phase, axis=1)
 hcross_vec = prefactor * np.sum(Hc_coef * sin_phase, axis=1)
@@ -117,15 +121,19 @@ hcross_vec = prefactor * np.sum(Hc_coef * sin_phase, axis=1)
 # hplus_vec and hcross_vec are the full time series (length N+1)
 hpl = hplus_vec.copy()
 hcr = hcross_vec.copy()
-noise = np.random.normal(0, 0, N+1)
 
 plt.figure(figsize=(8,5))
-plt.plot(t, hcr+noise, label='Hx (cross)', color='blue')
-plt.plot(t, hpl+noise, label='Hp (plus)', color='red')
-plt.legend()
-plt.xlabel(r"Time (Seconds $\times 10^2$)")
-plt.ylabel("Strain amplitude")
+plt.plot(t, hcr, label='Hx (cross)', color='blue')
+plt.plot(t, hpl, label='Hp (plus)', color='red')
+plt.legend(loc='upper right')
+plt.xlabel("Time (Seconds)", fontsize=15)
+plt.ylabel("Strain amplitude", fontsize=15)
+plt.title("")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
 plt.title("Gravitational Wave Polarizations Over Time")
 plt.grid(True)
 plt.tight_layout()
+
 plt.show()
