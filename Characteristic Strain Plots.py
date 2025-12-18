@@ -4,11 +4,11 @@ from scipy.special import jv  # Bessel function of the first kind
 from scipy.signal import get_window
 
 ω0 = 0.00311*(2*np.pi) #Initial Frequency
-e0 = 0.000 #Initial Eccentricity
-m1 = 0.55*2e30 #Mass of Primary
-m2 = 0.27*2e30 #Mass of Secondary
-r = 1.54e20 #Distance of Binary from Observer
-I = 0.66 #Angle of Inclination
+e0 = 0.2 #Initial Eccentricity
+m1 = 0.5*2e30 #Mass of Primary
+m2 = 0.2*2e30 #Mass of Secondary
+r = 1.5e19 #Distance of Binary from Observer
+I = 0 #Angle of Inclination
 φ = 0 #Angle of Pericentre
 
 G = 6.67e-11 #Gravitational Constant
@@ -16,8 +16,8 @@ c = 3e8 #Speed of Light
 a0 = (G*(m1+m2)/ω0**2)**(1/3) #Initial Semimajor Axis
 
 #Number of timesteps and the time interval value
-N = 4000000
-h = 32
+N = 1000
+h = 10
 T = N*h
 
 #"Independent" variables (at least independent to begin with)
@@ -54,40 +54,42 @@ Bn = a2_over_n * (1.0 - e[:, None]**2) * (J_p2 - J_m2)
 Cn = a2_over_n * np.sqrt(1.0 - e[:, None]**2) * (J_p2 + J_m2 - e[:, None] * (J_p1 + J_m1))
 
 # Compute omega for each time (note: omega depends on a[i])
-omega = np.sqrt(G * (m1 + m2) / a**3)      # shape (N+1,)
+omega = np.sqrt(G*(m1 + m2)/a**3)
+nomegasquared = (omega[:, None]**2) * (n[None, :])**2
+print(np.shape(nomegasquared))
 
-# Compute the per-time-per-harmonic phase: n * omega_i * t_i
-# For each time i and harmonic n: phase[i,n] = n * omega[i] * t[i]
-phase = (omega * t)[:, None] * n[None, :]  # shape (N+1, nmax)
+# --- Phase (still (N+1,nmax)) ---
+phase = (omega * t)[:, None] * n[None, :]
 
 cos_phase = np.cos(phase)
 sin_phase = np.sin(phase)
 
-# Precompute geometric angle combinations (scalars)
-Cphi = np.cos(φ); Sphi = np.sin(φ)
-C2phi = np.cos(2.0*φ); S2phi = np.sin(2.0*φ)
-CI = np.cos(I); SI = np.sin(I)
+# --- Geometric angles ---
+Cphi = np.cos(φ)
+Sphi = np.sin(φ)
+C2phi = np.cos(2.0*φ)
+S2phi = np.sin(2.0*φ)
+CI = np.cos(I)
+SI = np.sin(I)
 
-# Coefficient arrays multiplying the trigonometric time dependence
-Hp_coef = (
+# --- Coefficient arrays ---
+Hp_coef = nomegasquared*(
     An * (Cphi**2 - Sphi**2 * CI**2)
     + Bn * (Sphi**2 - Cphi**2 * CI**2)
     - Cn * (np.sin(2.0*φ)) * (1.0 + CI**2)
-)   # shape (N+1, nmax)
+)
 
-Hc_coef = (
+Hc_coef = nomegasquared*(
     2.0 * C2phi * CI * Cn
     + (An - Bn) * S2phi * SI
-)   # shape (N+1, nmax)
+)
 
-# Mass factor
+# --- Mass factors ---
 mu = (m1 * m2) / (m1 + m2)
-mc = ((m1*m2)**(3/5))/((m1+m2)**(1/5))
+mc = ((m1*m2)**(3/5)) / ((m1+m2)**(1/5))
 
-# Now compute the summed harmonic contributions (vectorized)
-# sum over harmonics (axis=1) to collapse to shape (N+1,)
-prefactor = - (mu * (omega**2) * G) / (r * c**4)   # shape (N+1,)
-prefactor1 = - 2*((G*mc)**(5/3))/(r * c**4 * a**2)   # shape (N+1,)
+# --- Prefactors (now scalars repeated over N) ---
+prefactor = - (mu * G) / (r * c**4)
 
 hplus_vec  = prefactor * np.sum(Hp_coef * cos_phase, axis=1)
 hcross_vec = prefactor * np.sum(Hc_coef * sin_phase, axis=1)
@@ -126,8 +128,8 @@ def Snwithc(x):
 f = λ[1:]
 LISAnoisePSD = Snwithc(f)
 
-characstrainX = 4*abs(X)[1:] * np.sqrt(2*f/T)
-characstrainY = 4*abs(Y)[1:] * np.sqrt(2*f/T)
+characstrainX = np.sqrt(0.5)*abs(X)[1:]*np.sqrt(2*f/T)
+characstrainY = np.sqrt(0.5)*abs(Y)[1:]*np.sqrt(2*f/T)
 fnoisecurve = np.sqrt(f*LISAnoisePSD)
 
 plt.figure(figsize=(8,5))
@@ -135,13 +137,12 @@ plt.plot(np.log10(f), np.log10(characstrainY), label='Characteristic Strain in H
 plt.plot(np.log10(f), np.log10(characstrainX), label='Characteristic Strain in Hplus', color='red')
 plt.plot(np.log10(f), np.log10(fnoisecurve), label='Characteristic Strain in Noise', color='green')
 plt.legend()
-plt.xlabel("log10(Frequency (Hz))")
-plt.ylabel("log10(Characteristic Strain)")
+plt.xlabel("log10(Frequency (Hz))", fontsize=15)
+plt.ylabel("log10(Characteristic Strain)", fontsize=15)
 plt.title("Characteristic Strain for HM Cancri and Noise")
 plt.grid(True)                     # major grid
 plt.minorticks_on()               # enable minor ticks
 plt.grid(which='minor', linestyle=':', alpha=0.4)   # minor grid
-plt.xlim(-3.7, -2)
-plt.ylim(-21, -18)
 plt.tight_layout()
 plt.show()
+
