@@ -39,7 +39,7 @@ t_jax = jnp.asarray(t)
 # 2. True signal parameters
 # ============================================================
 
-true_f0 = 0.00611
+true_f0 = 0.00311
 ω = true_f0 * np.pi
 true_e = 0.1
 m1 = 0.5 * 2e30
@@ -178,9 +178,9 @@ def Snwithc(f):
 b = np.zeros(len(h_fft))
 b[1:] = np.sqrt(Snwithc(freqs[1:]) * N * dt / 4)
 
-true_noise = b
+noise_magnitude = b
 
-noise_fft = true_noise * (
+noise_fft = noise_magnitude * (
     np.random.randn(len(h_fft)) +
     1j * np.random.randn(len(h_fft))
 )
@@ -205,46 +205,31 @@ plt.show()
 # ============================================================
 
 class FFTGWLikelihood(bilby.Likelihood):
-    def __init__(self, t, data_fft, window, dt):
-        super().__init__()
-
+    def __init__(self, t, data_fft, dt):
+        super().__init__(parameters=dict(A=None, f0=None, e=None, phi=None))
+        self.freq_mask = (freqs > 0) & (freqs < 0.05)
         self.t = t
         self.data_fft = data_fft
-        self.window = window
         self.dt = dt
-        self.norm = np.sqrt(np.sum(window**2) / len(window))
-        self.noise = true_noise
-
-        self.freqs = np.fft.rfftfreq(len(t), d=dt)
-        self.freq_mask = (self.freqs > 0) & (self.freqs < 0.05)
-
-        self.parameters = dict(A=None, f0=None, e=None, phi=None)
 
     def log_likelihood(self):
-        A   = self.parameters["A"]
-        f0  = self.parameters["f0"]
-        e   = self.parameters["e"]
-        phi = self.parameters["phi"]
+        A   = jnp.asarray(self.parameters["A"])
+        f0  = jnp.asarray(self.parameters["f0"])
+        e   = jnp.asarray(self.parameters["e"])
+        phi = jnp.asarray(self.parameters["phi"])
 
-        #map eccentricity → Bessel slice
-        J_slice = get_J_slice_interp_jax(e)
+        J = get_J_slice_interp_jax(e)
 
-        h_td_jax = gw_time_domain_jax(
-        t_jax,
-        A,
-        f0,
-        e,
-        J_slice,
-        I,
-        phi,
-        n_vals_jax
+        h_td = gw_time_domain_jax(
+            t_jax, A, f0, e,
+            J, I, phi, n_vals_jax
         )
 
-        h_td = np.asarray(h_td_jax)
-        h_fft = self.dt * jnp.fft.rfft(h_td * self.window) / self.norm
+        h_fft = dt * jnp.fft.rfft(h_td * window_jax) / norm
+        h_fft = np.asarray(h_fft)
 
-        diff = self.data_fft[self.freq_mask] - h_fft[self.freq_mask]
-        noise = self.noise[self.freq_mask]
+        diff = data_fft[self.freq_mask] - h_fft[self.freq_mask]
+        noise = noise_magnitude[self.freq_mask]
 
         return -0.5 * np.sum((diff.real**2 + diff.imag**2) / noise**2) - 0.5 * np.sum(np.log(2 * np.pi * noise**2))
 
@@ -254,7 +239,7 @@ class FFTGWLikelihood(bilby.Likelihood):
 
 priors = dict(
     A   = bilby.core.prior.Uniform(0, 4e-21, "A"),
-    f0  = bilby.core.prior.Uniform(0.0055, 0.0065, "f0"),
+    f0  = bilby.core.prior.Uniform(0.003, 0.004, "f0"),
     e   = bilby.core.prior.Uniform(0, 0.2, "e"),
     phi = bilby.core.prior.Uniform(0.9*np.pi, 1.1*np.pi, "phi"),
 )
@@ -263,7 +248,7 @@ priors = dict(
 # 9. Run bilby
 # ============================================================
 
-likelihood = FFTGWLikelihood(t, data_fft, window, dt)
+likelihood = FFTGWLikelihood(t, data_fft, dt)
 
 result = bilby.run_sampler(
     likelihood=likelihood,
