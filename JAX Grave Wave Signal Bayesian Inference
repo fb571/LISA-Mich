@@ -45,7 +45,7 @@ true_e = 0.1
 m1 = 0.5 * 2e30
 m2 = 0.5 * 2e30
 r = 1.5e19
-I = np.pi/4
+true_CI = np.cos(np.pi/4)
 
 G = 6.67e-11
 c = 3e8
@@ -95,26 +95,25 @@ def get_J_slice_interp_jax(e):
 # ============================================================
 
 @jax.jit
-def gw_time_domain_jax(t, A, f0, e, J_slice, I, phi, n_vals):
+def gw_time_domain_jax(t, A, f0, e, J_slice, CI, phi, n_vals):
     omega = 2.0 * jnp.pi * f0
     pref = -A
 
-    CI = jnp.cos(I)
     Cphi = jnp.cos(phi)
     Sphi = jnp.sin(phi)
-
-    nj = n_vals
+    C2phi = jnp.cos(2.0*phi)
+    S2phi = jnp.sin(2.0*phi)
 
     Jm2 = J_slice[:, 0]
     Jm1 = J_slice[:, 1]
     Jp1 = J_slice[:, 2]
     Jp2 = J_slice[:, 3]
+    
+    nAn = n_vals * (Jm2 - Jp2 - 2.0 * e * (Jm1 - Jp1))
+    nBn = n_vals * (1.0 - e * e) * (Jp2 - Jm2)
+    nCn = n_vals * jnp.sqrt(1.0 - e * e) * (Jp2 + Jm2 - e * (Jp1 + Jm1))
 
-    nAn = nj * (Jm2 - Jp2 - 2.0 * e * (Jm1 - Jp1))
-    nBn = nj * (1.0 - e * e) * (Jp2 - Jm2)
-    nCn = nj * jnp.sqrt(1.0 - e * e) * (Jp2 + Jm2 - e * (Jp1 + Jm1))
-
-    phase = omega * t[:, None] * nj[None, :]
+    phase = omega * t[:, None] * n_vals[None, :]
 
     A_term = (Cphi**2 - Sphi**2 * CI**2)
     B_term = (Sphi**2 - Cphi**2 * CI**2)
@@ -125,7 +124,13 @@ def gw_time_domain_jax(t, A, f0, e, J_slice, I, phi, n_vals):
         - nCn[None, :] * C_term * jnp.sin(phase)
     )
 
-    return pref * jnp.sum(hp, axis=1)
+    hc = (
+    2.0 * jnp.sin(phase) * C2phi * CI * nCn
+    + (nAn - nBn) * jnp.cos(phase) * S2phi * CI
+)
+    hplus = pref * jnp.sum(hp, axis=1)
+    hcross = pref * jnp.sum(hc, axis=1)
+    return jnp.stack([hplus, hcross], axis=1)
 
 J_slice = get_J_slice_interp_jax(true_e)
 
@@ -135,7 +140,7 @@ h_true = gw_time_domain_jax(
     true_f0,
     true_e,
     J_slice,
-    I,
+    true_CI,
     true_phi,
     n_vals_jax
 )
@@ -149,7 +154,10 @@ window_jax = jnp.asarray(window)
 W = np.sum(window**2) / N
 norm = np.sqrt(W)
 
-h_fft = dt * jnp.fft.rfft(h_true * window_jax) / norm
+h_fft = jnp.stack([
+    dt * jnp.fft.rfft(h_true[:,0] * window_jax) / norm,
+    dt * jnp.fft.rfft(h_true[:,1] * window_jax) / norm
+], axis=0)
 freqs = np.fft.rfftfreq(N, d=dt)
 
 print(true_A)
@@ -175,15 +183,15 @@ def Snwithc(f):
            * (1 + (6/10) * (f / fstar)**2) + Scf
 
 
-b = np.zeros(len(h_fft))
+b = np.zeros(len(freqs))
 b[1:] = np.sqrt(Snwithc(freqs[1:]) * N * dt / 4)
 
 noise_magnitude = b
 
-noise_fft = noise_magnitude * (
-    np.random.randn(len(h_fft)) +
-    1j * np.random.randn(len(h_fft))
-)
+noise_fft = jnp.stack([
+    noise_magnitude * (np.random.randn(len(freqs)) + 1j*np.random.randn(len(freqs))),
+    noise_magnitude * (np.random.randn(len(freqs)) + 1j*np.random.randn(len(freqs)))
+], axis=0)
 
 data_fft = h_fft + noise_fft
 
@@ -192,8 +200,10 @@ data_fft = h_fft + noise_fft
 # ============================================================
 
 plt.figure(figsize=(8, 5))
-plt.plot(freqs[200:], (data_fft.real)[200:], label="Re(data FFT)")
-plt.plot(freqs[200:], (data_fft.imag)[200:], label="Im(data FFT)")
+plt.plot(freqs[200:], (data_fft.real)[0,200:], label="Re(h+ FFT)")
+plt.plot(freqs[200:], (data_fft.imag)[0,200:], label="Im(h+ FFT)")
+plt.plot(freqs[200:], (data_fft.real)[1,200:], label="Re(hx FFT)")
+plt.plot(freqs[200:], (data_fft.imag)[1,200:], label="Im(hx FFT)")
 plt.legend()
 plt.xlabel("Frequency (Hz)")
 plt.ylabel("FFT amplitude")
@@ -204,10 +214,29 @@ plt.show()
 # 7. Likelihood (allocation-free)
 # ============================================================
 
+freq_mask = (freqs > 0) & (freqs < 0.05)
+freq_indices = np.where(freq_mask)[0]  # static Python array
+freq_indices_jax = jnp.asarray(freq_indices)
+
+def log_likelihood_fn(A, f0, e, phi, CI, t, data_fft, dt, n_vals_jax,
+                      window_jax, norm, noise_magnitude, freq_indices):
+    J = get_J_slice_interp_jax(e)
+    h_td = gw_time_domain_jax(t, A, f0, e, J, CI, phi, n_vals_jax)
+    h_fft = jnp.stack([
+        dt * jnp.fft.rfft(h_td[:,0] * window_jax) / norm,
+        dt * jnp.fft.rfft(h_td[:,1] * window_jax) / norm
+    ], axis=0)
+    diff = jnp.take(data_fft, freq_indices_jax, axis=1) - jnp.take(h_fft, freq_indices_jax, axis=1)
+    noise = jnp.stack([jnp.take(noise_magnitude, freq_indices_jax)]*2, axis=0)
+    return -0.5 * jnp.sum((diff.real**2 + diff.imag**2) / noise**2) \
+           -0.5 * jnp.sum(jnp.log(2 * jnp.pi * noise**2))
+
+# JIT the pure function
+log_likelihood_jit = jax.jit(log_likelihood_fn)
+
 class FFTGWLikelihood(bilby.Likelihood):
     def __init__(self, t, data_fft, dt):
-        super().__init__(parameters=dict(A=None, f0=None, e=None, phi=None))
-        self.freq_mask = (freqs > 0) & (freqs < 0.05)
+        super().__init__(parameters=dict(A=None, f0=None, e=None, phi=None, CI=None))
         self.t = t
         self.data_fft = data_fft
         self.dt = dt
@@ -217,21 +246,10 @@ class FFTGWLikelihood(bilby.Likelihood):
         f0  = jnp.asarray(self.parameters["f0"])
         e   = jnp.asarray(self.parameters["e"])
         phi = jnp.asarray(self.parameters["phi"])
-
-        J = get_J_slice_interp_jax(e)
-
-        h_td = gw_time_domain_jax(
-            t_jax, A, f0, e,
-            J, I, phi, n_vals_jax
-        )
-
-        h_fft = dt * jnp.fft.rfft(h_td * window_jax) / norm
-        h_fft = np.asarray(h_fft)
-
-        diff = data_fft[self.freq_mask] - h_fft[self.freq_mask]
-        noise = noise_magnitude[self.freq_mask]
-
-        return -0.5 * np.sum((diff.real**2 + diff.imag**2) / noise**2) - 0.5 * np.sum(np.log(2 * np.pi * noise**2))
+        CI = jnp.asarray(self.parameters["CI"])
+        return log_likelihood_jit(A, f0, e, phi, CI,
+                                  self.t, self.data_fft, self.dt,
+                                  n_vals_jax, window_jax, norm, noise_magnitude, freq_indices_jax)
 
 # ============================================================
 # 8. Priors
@@ -239,9 +257,10 @@ class FFTGWLikelihood(bilby.Likelihood):
 
 priors = dict(
     A   = bilby.core.prior.Uniform(0, 4e-21, "A"),
-    f0  = bilby.core.prior.Uniform(0.003, 0.004, "f0"),
+    f0  = bilby.core.prior.Uniform(0.002, 0.004, "f0"),
     e   = bilby.core.prior.Uniform(0, 0.2, "e"),
     phi = bilby.core.prior.Uniform(0.9*np.pi, 1.1*np.pi, "phi"),
+    CI = bilby.core.prior.Uniform(0.9*np.cos(np.pi/4), 1.1*np.cos(np.pi/4),"CI")
 )
 
 # ============================================================
