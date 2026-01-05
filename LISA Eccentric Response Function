@@ -1,0 +1,283 @@
+#Block1
+
+import numpy as np
+import matplotlib.pyplot as plt
+import numba as nb
+%matplotlib inline
+
+import h5py
+from fastlisaresponse import pyResponseTDI, ResponseWrapper
+from astropy import units as un
+
+from lisatools.detector import EqualArmlengthOrbits, ESAOrbits
+
+YRSID_SI = 31558149.763545603
+
+#Block2
+
+import bilby
+from scipy import special
+from scipy.signal import get_window
+
+import bilby.core.sampler.base_sampler as bs
+import shutil
+
+_real_rmtree = shutil.rmtree
+
+def _safe_rmtree(path, *args, **kwargs):
+    try:
+        _real_rmtree(path, *args, **kwargs)
+    except PermissionError:
+        pass
+
+shutil.rmtree = _safe_rmtree
+
+# ============================================================
+# 1. Time grid
+# ============================================================
+
+np.random.seed(123)
+
+label = "freq_peak_with_noise"
+outdir = "outdir"
+bilby.utils.check_directory_exists_and_if_not_mkdir(outdir)
+
+
+T = 1.0 #years
+t0 = 0
+dt = 100
+t = np.arange(0, T*YRSID_SI + t0, dt)
+N = len(t)
+print(N)
+
+# ============================================================
+# True signal parameters
+# ============================================================
+
+true_f0 = 0.00611
+ω = true_f0 * np.pi
+true_e = 0.1
+m1 = 0.5 * 2e30
+m2 = 0.5 * 2e30
+r = 1.5e19
+I = np.pi/4
+
+G = 6.67e-11
+c = 3e8
+
+a0 = (G * (m1 + m2) / ω**2) ** (1/3)
+mu = (m1 * m2) / (m1 + m2)
+prefactor = 4 * ω**2 * a0**2 * (mu * G) / (r * c**4)
+
+true_A = prefactor
+true_phi = np.pi
+
+nmax = 10
+n_vals = np.arange(1, nmax + 1)
+
+e_min, e_max, de = 0, 1, 0.001
+e_grid = np.arange(e_min, e_max + de/2, de)
+Ne = len(e_grid)
+
+# Shape: (Ne, nmax, 4)
+J_table_3d = np.empty((Ne, nmax, 4), dtype=np.float64)
+
+for ie, e in enumerate(e_grid):
+    for j, nj in enumerate(n_vals):
+        x = nj * e
+        J_table_3d[ie, j, 0] = special.jv(nj - 2, x)
+        J_table_3d[ie, j, 1] = special.jv(nj - 1, x)
+        J_table_3d[ie, j, 2] = special.jv(nj + 1, x)
+        J_table_3d[ie, j, 3] = special.jv(nj + 2, x)
+
+assert J_table_3d.shape == (Ne, nmax, 4)
+
+def get_J_slice_interp(e):
+    # clamp
+    if e <= e_grid[0]:
+        return J_table_3d[0]
+    if e >= e_grid[-1]:
+        return J_table_3d[-1]
+
+    x = (e - e_min) / de
+    i0 = int(np.floor(x))
+    w = x - i0
+
+    return (1 - w) * J_table_3d[i0] + w * J_table_3d[i0 + 1]
+
+# ============================================================
+# 3. Allocation-free time-domain signal model
+# ============================================================
+
+@nb.njit(fastmath=True)
+def gw_time_domain_inplace(out, t, A, f0, e,J_slice, I, phi, n_vals):
+    Nt = t.size
+    nmax = n_vals.size
+
+    omega = 2 * np.pi * f0
+    pref = -A
+
+    CI = np.cos(I)
+    Cphi = np.cos(phi)
+    C2phi = np.cos(2*phi)
+    Sphi = np.sin(phi)
+    S2phi = np.sin(2*phi)
+
+    for i in range(Nt):
+        ti = t[i]
+        hp = 0.0
+        hc = 0.0
+
+        for j in range(nmax):
+            nj = n_vals[j]
+
+            Jm2 = J_slice[j, 0]
+            Jm1 = J_slice[j, 1]
+            Jp1 = J_slice[j, 2]
+            Jp2 = J_slice[j, 3]
+
+            nAn = nj * (Jm2 - Jp2 - 2.0 * e * (Jm1 - Jp1))
+            nBn = nj * (1.0 - e*e) * (Jp2 - Jm2)
+            nCn = nj * np.sqrt(1.0 - e*e) * (Jp2 + Jm2 - e * (Jp1 + Jm1))
+
+            phase = omega * nj * ti
+
+            hp += (
+                (nAn * (Cphi*Cphi - Sphi*Sphi*CI*CI)
+               + nBn * (Sphi*Sphi - Cphi*Cphi*CI*CI)) * np.cos(phase)
+               - nCn * np.sin(2*phi) * (1 + CI*CI) * np.sin(phase)
+            )
+
+            hc += (
+                (2 * np.sin(phase)) * C2phi * CI * nCn
+                + (nAn - nBn) * np.cos(phase) * S2phi * CI
+            )
+
+        out[i] = pref * (hp + 1j * hc)
+
+@nb.njit(cache=True)
+def jit_rfft(x):
+    return np.fft.rfft(x)
+
+
+# Preallocate buffer ONCE
+h_td_buffer = np.empty(len(t), dtype=np.complex128)
+
+e_idx = np.argmin(np.abs(e_grid - true_e))
+J_slice = get_J_slice_interp(true_e)
+
+gw_time_domain_inplace(
+    h_td_buffer,
+    t,
+    true_A,
+    true_f0,
+    true_e,
+    J_slice,   # <-- MUST be (nmax, 4) ndarray
+    I,
+    true_phi,
+    n_vals
+)
+
+h_true = h_td_buffer.copy()
+
+#Block3
+
+from fastlisaresponse.utils.parallelbase import ParallelModuleBase
+
+# Parallel module base can help to facilitate customized gpu use.
+class GBWave(ParallelModuleBase):
+    def __init__(self, force_backend=None):
+        super().__init__(force_backend=force_backend)
+
+    @classmethod
+    def supported_backends(cls):
+        return ["fastlisaresponse_" + _tmp for _tmp in cls.GPU_RECOMMENDED()]
+
+    def __call__(self, A, f0, e, I, phi, T=1.0, dt=10.0):
+        n_vals = np.arange(1,11)
+
+        # get the t array
+        t = self.xp.arange(0.0, T * YRSID_SI, dt)
+
+        h_td_buffer = np.empty(len(t), dtype=np.complex128)
+        e_idx = np.argmin(np.abs(e_grid - e))
+        J_slice = get_J_slice_interp(e)
+        
+        gw_time_domain_inplace(
+        h_td_buffer,
+        t,
+        A,
+        f0,
+        e,
+        J_slice,
+        I,
+        phi,
+        n_vals,
+        )
+
+        return h_td_buffer  # Return the buffer that was modified in-place
+
+#Block4
+
+gb = GBWave(force_backend=None)
+
+#Block5
+
+force_backend = None
+
+T = 1.0  # years
+t0 = 100000.0  # time at which signal starts (chops off data at start of waveform where information is not correct)
+
+sampling_frequency = 0.01
+dt = 1 / sampling_frequency
+
+# order of the langrangian interpolation
+order = 25
+
+# 1st or 2nd or custom (see docs for custom)
+tdi_gen = "2nd generation"
+
+index_lambda = 5
+index_beta = 6
+
+tdi_kwargs_esa = dict(
+    order=order, tdi=tdi_gen, tdi_chan="AET",
+)
+
+gb_lisa_esa = ResponseWrapper(
+    gb,
+    T,
+    dt,
+    index_lambda,
+    index_beta,
+    t0=t0,
+    flip_hx=False,  # set to True if waveform is h+ - ihx
+    force_backend=force_backend,
+    remove_sky_coords=True,  # True if the waveform generator does not take sky coordinates
+    is_ecliptic_latitude=True,  # False if using polar angle (theta)
+    remove_garbage=True,  # removes the beginning of the signal that has bad information
+    orbits=EqualArmlengthOrbits(),
+    **tdi_kwargs_esa,
+)
+
+# define GB parameters
+A = 0.5*1.084702251e-22
+f = 0.5*2.35962078e-3
+e = 0
+I = 1.11820901
+phi = 0
+
+beta = 0.9805742971871619
+lam = 1.22979888
+
+#Block6
+
+chans = gb_lisa_esa(A, f, e, I, phi, lam, beta)
+
+#Block7
+
+fig, ax = plt.subplots(3, 1, sharex=True)
+
+for i, lab in enumerate(["A", "E", "T"]):
+    ax[i].plot(np.arange(len(chans[0])) * dt / YRSID_SI, chans[i])
+    ax[i].set_ylabel(lab)
