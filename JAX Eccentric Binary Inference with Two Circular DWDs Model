@@ -5,7 +5,7 @@ from scipy import special
 from scipy.signal import get_window
 import jax
 import jax.numpy as jnp
-
+from functools import partial
 import bilby.core.sampler.base_sampler as bs
 import shutil
 
@@ -18,6 +18,8 @@ def _safe_rmtree(path, *args, **kwargs):
         pass
 
 shutil.rmtree = _safe_rmtree
+
+jax.config.update("jax_enable_x64", False)
 
 # ============================================================
 # 1. Time grid
@@ -65,6 +67,7 @@ e_grid = np.arange(e_min, e_max + de/2, de)
 Ne = len(e_grid)
 e_grid_jax = jnp.asarray(e_grid)
 
+# --- build using SciPy (once) ---
 J_table_3d = np.empty((Ne, nmax, 4), dtype=np.float64)
 
 for ie, e in enumerate(e_grid):
@@ -198,10 +201,10 @@ data_fft = h_fft + noise_fft
 # ============================================================
 
 plt.figure(figsize=(8, 5))
-plt.plot(freqs[200:], (data_fft.real)[0,200:], label="Re(h+ FFT)")
-plt.plot(freqs[200:], (data_fft.imag)[0,200:], label="Im(h+ FFT)")
-plt.plot(freqs[200:], (data_fft.real)[1,200:], label="Re(hx FFT)")
-plt.plot(freqs[200:], (data_fft.imag)[1,200:], label="Im(hx FFT)")
+plt.plot(freqs[20:], (data_fft.real)[0,20:], label="Re(h+ FFT)")
+plt.plot(freqs[20:], (data_fft.imag)[0,20:], label="Im(h+ FFT)")
+plt.plot(freqs[20:], (data_fft.real)[1,20:], label="Re(hx FFT)")
+plt.plot(freqs[20:], (data_fft.imag)[1,20:], label="Im(hx FFT)")
 plt.legend()
 plt.xlabel("Frequency (Hz)")
 plt.ylabel("FFT amplitude")
@@ -212,9 +215,13 @@ plt.show()
 # 7. Likelihood (allocation-free)
 # ============================================================
 
-freq_mask = (freqs > 0) & (freqs < 0.05)
-freq_indices = np.where(freq_mask)[0]
+freq_mask = (freqs > 0) & (freqs < 0.01)
+freq_indices = np.where(freq_mask)[0]  # static Python array
 freq_indices_jax = jnp.asarray(freq_indices)
+
+noise_slice = jnp.take(noise_magnitude, freq_indices_jax)
+noise2 = noise_slice * noise_slice
+log_norm = jnp.sum(jnp.log(2 * jnp.pi * noise2))
 
 def log_likelihood_fn(A1, A2, f01, f02, phi1, phi2, CI1, CI2, t, data_fft, dt, n_vals_jax,
                       window_jax, norm, noise_magnitude, freq_indices):
@@ -226,12 +233,23 @@ def log_likelihood_fn(A1, A2, f01, f02, phi1, phi2, CI1, CI2, t, data_fft, dt, n
         dt * jnp.fft.rfft((h_td1+h_td2)[:,1] * window_jax) / norm
     ], axis=0)
     diff = jnp.take(data_fft, freq_indices_jax, axis=1) - jnp.take(h_fft, freq_indices_jax, axis=1)
-    noise = jnp.stack([jnp.take(noise_magnitude, freq_indices_jax)]*2, axis=0)
-    return -0.5 * jnp.sum((diff.real**2 + diff.imag**2) / noise**2) \
-           -0.5 * jnp.sum(jnp.log(2 * jnp.pi * noise**2))
+    return -0.5 * jnp.sum((diff.real**2 + diff.imag**2) / noise2) \
+           -0.5 * log_norm
 
 # JIT the pure function
-log_likelihood_jit = jax.jit(log_likelihood_fn)
+log_likelihood_jit = jax.jit(
+    partial(
+        log_likelihood_fn,
+        t=t_jax,
+        data_fft=data_fft,
+        dt=dt,
+        n_vals_jax=n_vals_jax,
+        window_jax=window_jax,
+        norm=norm,
+        noise_magnitude=noise_magnitude,
+        freq_indices=freq_indices_jax
+    )
+)
 
 class FFTGWLikelihood(bilby.Likelihood):
     def __init__(self, t, data_fft, dt):
@@ -244,45 +262,45 @@ class FFTGWLikelihood(bilby.Likelihood):
         A1   = jnp.asarray(self.parameters["A1"])
         A2   = jnp.asarray(self.parameters["A2"])
         f01  = jnp.asarray(self.parameters["f01"])
-        f02  = jnp.asarray(self.parameters["f02"])
+        f02 = jnp.asarray(self.parameters["f02"])
         phi1 = jnp.asarray(self.parameters["phi1"])
         phi2 = jnp.asarray(self.parameters["phi2"])
         CI1 = jnp.asarray(self.parameters["CI1"])
         CI2 = jnp.asarray(self.parameters["CI2"])
-        return log_likelihood_jit(A1, A2, f01, f02, phi1, phi2, CI1, CI2,
-                                  self.t, self.data_fft, self.dt,
-                                  n_vals_jax, window_jax, norm, noise_magnitude, freq_indices_jax)
+        return log_likelihood_jit(A1, A2, f01, f02, phi1, phi2, CI1, CI2)
 
 # ============================================================
 # 8. Priors
 # ============================================================
 
-priors = dict(
-    A1   = bilby.core.prior.Uniform(
-        0, 4e-21, name="A1", latex_label=r"$A1$"
-    ),
-    A2   = bilby.core.prior.Uniform(
-        0, 4e-21, name="A2", latex_label=r"$A2$"
-    ),
-    f01  = bilby.core.prior.Uniform(
-        0.002, 0.02, name="f_01", latex_label=r"$f_01\ \mathrm{[Hz]}$"
-    ),
-    f02  = bilby.core.prior.Uniform(
-        0.002, 0.02, name="f_02", latex_label=r"$f_02\ \mathrm{[Hz]}$"
-    ),
-    phi1 = bilby.core.prior.Uniform(
-        0, np.pi, name="phi1", latex_label=r"$\phi1$"
-    ),
-    phi2 = bilby.core.prior.Uniform(
-        0, np.pi, name="phi2", latex_label=r"$\phi2$"
-    ),
-    CI1 = bilby.core.prior.Uniform(
-        -1, 1, name="CI1", latex_label=r"$\cos{\iota}1$"
-    ),
-    CI2 = bilby.core.prior.Uniform(
-        -1, 1, name="CI1", latex_label=r"$\cos{\iota}2$"
-    ),
-)
+def convert_f01_f02_to_df0(parameters):
+    """
+    Function to convert between sampled parameters and constraint parameter.
+
+    Parameters
+    ----------
+    parameters: dict
+        Dictionary containing sampled parameter values, 'f01', 'f02'.
+
+    Returns
+    -------
+    dict: Dictionary with constraint parameter 'df0' added.
+    """
+    converted_parameters = parameters.copy()
+    converted_parameters['df0'] = parameters['f02'] - parameters['f01']
+    return converted_parameters
+
+from bilby.core.prior import PriorDict, Uniform, Constraint
+priors = PriorDict(conversion_function=convert_f01_f02_to_df0)
+priors["A1"] = Uniform(0, 4e-21, name="A1", latex_label=r"$A1$")
+priors["A2"] = Uniform(0, 4e-21, name="A2", latex_label=r"$A2$")
+priors["f01"] = Uniform(0.003, 0.005, name="f_01", latex_label=r"$f_01\ \mathrm{[Hz]}$")
+priors["f02"] = Uniform(0.003, 0.005, name="f_02", latex_label=r"$f_02\ \mathrm{[Hz]}$")
+priors["df0"] = Constraint(minimum=0.0005, maximum=0.002, name="df0", latex_label=r"\Delta f_0\ \mathrm{[Hz]}")
+priors["phi1"] = 0
+priors["phi2"] = 0
+priors["CI1"] = Uniform(-1, 1, name="CI1", latex_label=r"\cos \iota_1")
+priors["CI2"] = Uniform(-1, 1, name="CI2", latex_label=r"\cos \iota_2")
 
 # ============================================================
 # 9. Run bilby
@@ -293,7 +311,7 @@ likelihood = FFTGWLikelihood(t, data_fft, dt)
 result = bilby.run_sampler(
     likelihood=likelihood,
     priors=priors,
-    sampler="dynesty",
+    sampler="ultranest",
 
     outdir="outdir",
     label="fft_gw_freq_noise",
@@ -302,33 +320,20 @@ result = bilby.run_sampler(
     use_temporary_directory=False, 
 
     clean=False,
-    nlive=20,
-    sample="rwalk",
-    walks=50,
-    dlogz=0.1,
+    sampler_kwargs=dict(
+    log_level="warning",
+    stepsampler="slice"
+),
+    nlive=200,
 )
 
-param_order = ["A1", "A2", "f01", "f02", "phi1", "phi2", "CI1", "CI2"]
-
-plot_ranges = [
-    (0, 0.1 * true_A),                          # A1
-    (0, 0.1 * true_A),                          # A2
-    (0.002, 0.02),                              # f01
-    (0.002, 0.02),                              # f02
-    (0, 2*np.pi),                               # phi1
-    (0, 2*np.pi),                               # phi2
-    (-1, 1),                                    # CI1
-    (-1, 1),                                    # CI2
-]
-
-
+param_order = ["A1", "A2", "f01", "f02", "CI1", "CI2"]
 
 result.plot_corner(
     parameters=param_order,
     bins=40,
     smooth=1.0,
-    quantiles=[0.16, 0.84],   # ← Bilby expects length-2
-    range=plot_ranges,
+    quantiles=[0.16, 0.84],
 )
 plt.show()
 result.save_to_file()
