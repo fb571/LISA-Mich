@@ -55,7 +55,7 @@ mu = (m1 * m2) / (m1 + m2)
 prefactor = 4 * ω**2 * a0**2 * (mu * G) / (r * c**4)
 
 true_A = prefactor
-true_phi = np.pi
+true_phi = np.pi/2
 
 nmax = 10
 n_vals = np.arange(1, nmax + 1)
@@ -117,7 +117,7 @@ def gw_time_domain_jax(t, A, f0, e, J_slice, CI, phi, n_vals):
 
     A_term = (Cphi**2 - Sphi**2 * CI**2)
     B_term = (Sphi**2 - Cphi**2 * CI**2)
-    C_term = jnp.sin(2.0 * phi) * (1.0 + CI**2)
+    C_term = S2phi * (1.0 + CI**2)
 
     hp = (
         (nAn[None, :] * A_term + nBn[None, :] * B_term) * jnp.cos(phase)
@@ -257,10 +257,10 @@ class FFTGWLikelihood(bilby.Likelihood):
 
 priors = dict(
     A   = bilby.core.prior.Uniform(0, 4e-21, "A"),
-    f0  = bilby.core.prior.Uniform(0.002, 0.004, "f0"),
+    f0  = bilby.core.prior.Uniform(0.003, 0.006, "f0"),
     e   = bilby.core.prior.Uniform(0, 0.2, "e"),
-    phi = bilby.core.prior.Uniform(0.9*np.pi, 1.1*np.pi, "phi"),
-    CI = bilby.core.prior.Uniform(0.9*np.cos(np.pi/4), 1.1*np.cos(np.pi/4),"CI")
+    phi = bilby.core.prior.Uniform(0, np.pi, "phi"),
+    CI = bilby.core.prior.Uniform(-1, 1, "CI")
 )
 
 # ============================================================
@@ -285,6 +285,34 @@ result = bilby.run_sampler(
     nlive=400,
 )
 
-result.plot_corner()
+param_order = ["A", "f0", "e", "phi", "CI"]
+
+plot_ranges = [
+    (0.8 * true_A, 1.2 * true_A),              # A
+    (true_f0 - 1e-5, true_f0 + 1e-5),           # f0
+    (0.05, 0.15),                                 # e
+    (true_phi - 0.05, true_phi + 0.05),         # phi
+    (0.8*true_CI, 1.2*true_CI),                 # CI
+]
+
+truths = [
+    true_A,
+    true_f0,
+    true_e,
+    true_phi,
+    true_CI,
+]
+
+print(truths)
+
+result.plot_corner(
+    parameters=param_order,
+    truths=truths,
+    truth_color="red",
+    bins=40,
+    smooth=1.0,
+    quantiles=[0.16, 0.84],
+    range=plot_ranges,
+)
 plt.show()
 result.save_to_file()
